@@ -1,0 +1,32 @@
+####Thanks to my friend @MortyTech for sharing this piece of code and his help
+###Extend and grow Linux partition and filesystem
+it should be use fdisk /dev/sda or vda  and delete and recreate partition or instead install 
+cloud-utils-growpart package for growpart commands
+the syntax is correct ! don't touch it ! 😄
+
+
+    sudo growpart /dev/sda 1
+    sudo resize2fs /dev/sda1
+
+
+in this following example
+
+| /dev/vda2        | LVM PhysicalVolume |
+| ---------------- | ------------------ |
+| centos           | LVM VolumeGroup    |
+| /dev/centos/root | LVM LogicalVolume  |
+
+for LVM partition and filesystem extending you can use fdisk if growpart command is not installed  
+
+    growpart /dev/vda 2
+    
+    pvresize -v /dev/vda2
+    
+    lvextend -l +100%FREE /dev/centos/root
+    
+    xfs_growfs /dev/centos/root OR resize2fs /dev/centos/root
+
+you can remain 2% of FreeSpace of VolumeGroup for Snapshots  then :
+
+
+    lvextend -l +98%FREE /dev/centos/root
