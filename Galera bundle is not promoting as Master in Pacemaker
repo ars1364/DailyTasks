@@ -1,0 +1,38 @@
+Ref links :
+https://dba.stackexchange.com/questions/157500/how-to-recover-mariadb-galera-cluster-after-full-crash
+https://galeracluster.com/library/documentation/crash-recovery.html
+
+run this command on all controllers:
+    ss -tulpen | grep 3306
+other controllers have HAPROXY listed and listening on port 3306, but no MySQL process is listed in the unhealthy one!
+
+any healthy node:
+    docker ps | grep galera
+ensure Galera bundle docker is up, and the issue is just MySQL itself, interactive with its docker 
+    docker exec -it --user 0 <galera-bundle-docker-xx> bash
+and issue this command:
+    ps -aux | more
+in the output, you'll find the process name MySQL with the following command in front:
+    /usr/libexec/mysqld --defaults-file=/etc/my.cnf --basedir=/usr --datadir=/var/lib/mysql --plugin-dir=/usr/lib64/mariadb/plugin --user=mysql --wsrep_on=ON --wsrep_provider=/usr/lib64/galera/libgalera_smm.so --wsrep-cluster-address=gcomm://node0.internalapi.localdomain,node1.internalapi.localdomain,node2.internalapi.localdomain --log-error=/var/log/mysql/mysqld.log --open-files-limit=16384 --pid-file=/var/run/mysql/mysqld.pid --socket=/var/lib/mysql/mysql.sock --port=3306 --wsrep_start_position=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:xxxx
+###solution no1:
+
+remove wsrep_start_position and run this command on an unhealthy docker interactive server:
+
+    /usr/libexec/mysqld --defaults-file=/etc/my.cnf --basedir=/usr --datadir=/var/lib/mysql --plugin-dir=/usr/lib64/mariadb/plugin --user=mysql --wsrep_on=ON --wsrep_provider=/usr/lib64/galera/libgalera_smm.so --wsrep-cluster-address=gcomm://node0.internalapi.localdomain,node1.internalapi.localdomain,node2.internalapi.localdomain --log-error=/var/log/mysql/mysqld.log --open-files-limit=16384 --pid-file=/var/run/mysql/mysqld.pid --socket=/var/lib/mysql/mysql.sock --port=3306
+after the successful process starts, the lost wsrep positions will be claimed by MySQL; then restart the pacemaker service 
+
+###solution no 2:
+
+edit grastate.dat file in healthy node and set safe_to_bootstrap = 1 to mark it as a node with the correct wresp position number (seq no)
+
+File pathinside the docker: /var/lib/mysql/
+
+File path in controller: /var/lib/config-data/puppet-generated/
+
+    sed -i "/safe_to_bootstrap/s/0/1/" /var/lib/mysql/grastate.dat
+and run this command on unhealthy docker interactive
+
+    /usr/libexec/mysqld --defaults-file=/etc/my.cnf --basedir=/usr --datadir=/var/lib/mysql --plugin-dir=/usr/lib64/mariadb/plugin --user=mysql --wsrep_on=ON --wsrep_provider=/usr/lib64/galera/libgalera_smm.so --wsrep-cluster-address=gcomm://node0.internalapi.localdomain,node1.internalapi.localdomain,node2.internalapi.localdomain --log-error=/var/log/mysql/mysqld.log --open-files-limit=16384 --pid-file=/var/run/mysql/mysqld.pid --socket=/var/lib/mysql/mysql.sock --port=3306 --wsrep-recover
+MySQL will get the lost wsrep position from a marked node as a healthy one, and the issue will disappear.
+
+restart the pacemaker service on the unhealthy node, and done!
