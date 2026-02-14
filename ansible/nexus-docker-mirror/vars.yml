@@ -1,0 +1,18 @@
+# Nexus connection
+nexus_url: "http://127.0.0.1:8081"
+nexus_admin_user: "admin"
+nexus_admin_password: "{{ lookup('env', 'NEXUS_ADMIN_PASSWORD') | default('Cl0ud1n@t1ve!Nxs2026', true) }}"
+
+# Mirror settings
+docker_upstream_url: "https://download.docker.com"
+mirror_base_url: "https://apt.cloudinative.com/repository/docker-ce"
+
+# Repo names
+docker_ce_repo: "docker-ce"
+docker_gpg_repo: "docker-gpg"
+
+# Anonymous role to update
+anonymous_role_id: "anonymous-proxy-only"
+
+# Nginx config path on artifact VM
+nginx_conf_path: "/etc/nginx/nginx.conf"
