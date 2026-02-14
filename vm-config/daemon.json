@@ -1,0 +1,4 @@
+{
+  "registry-mirrors": ["https://docker.cloudinative.com"],
+  "insecure-registries": ["docker.cloudinative.com"]
+}

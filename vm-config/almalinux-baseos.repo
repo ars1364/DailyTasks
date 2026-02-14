@@ -1,0 +1,7 @@
+[baseos]
+name=AlmaLinux $releasever - BaseOS
+baseurl=http://dnf.cloudinative.com/almalinux-baseos/
+enabled=1
+gpgcheck=1
+countme=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-9
