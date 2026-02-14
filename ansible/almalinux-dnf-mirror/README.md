@@ -1,44 +1,36 @@
-# AlmaLinux DNF Mirror Configuration
+# AlmaLinux DNF Mirror Setup
 
-This Ansible playbook configures AlmaLinux VMs to use internal DNF and Docker mirrors hosted on cloudinative.com infrastructure.
+Configures AlmaLinux 9 VMs to use Cloudinative's internal Nexus mirrors exclusively. No public repos.
 
-## Components
+## What it does
 
-- **DNF Repositories**: AlmaLinux BaseOS, AppStream, and EPEL proxy repositories
-- **Docker Mirror**: Internal Docker registry mirror
-- **Package Installation**: Automated installation of docker-ce, postgresql, nginx, redis
+1. Adds `/etc/hosts` entries for *.cloudinative.com (until DNS propagates)
+2. Replaces all default repos with internal mirrors (baseos, appstream, epel, docker-ce)
+3. Installs nginx, redis, postgresql-server via DNF
+4. Installs Docker CE from internal mirror
+5. Configures Docker to pull from docker.cloudinative.com
+6. Pulls nginx, redis, postgres images
+7. Verifies zero public repos in use
 
 ## Prerequisites
 
-1. DNF proxy repositories must be created in Nexus:
-   - almalinux-baseos → https://repo.almalinux.org/almalinux/9/BaseOS/x86_64/os/
-   - almalinux-appstream → https://repo.almalinux.org/almalinux/9/AppStream/x86_64/os/
-   - epel-proxy → https://dl.fedoraproject.org/pub/epel/
-
-2. DNS record for dnf.cloudinative.com pointing to reverse proxy (176.65.243.214)
-
-3. Reverse proxy configured to route DNF requests to Nexus (10.20.0.40:8081)
+- Run `../nexus-dnf-repos/playbook.yml` first to create repos in Nexus
+- `dnf.cloudinative.com` and `docker.cloudinative.com` configured on reverse proxy
+- Target VM accessible via SSH (directly or via jump host)
 
 ## Usage
 
 ```bash
-ansible-playbook -i inventory configure-almalinux-mirrors.yml
+# Edit inventory with your VM IPs
+ansible-playbook -i inventory playbook.yml
 ```
 
-## Repository Configuration Files
+## Mirror URLs
 
-The playbook creates these repository files:
-
-- `/etc/yum.repos.d/almalinux-baseos.repo`
-- `/etc/yum.repos.d/almalinux-appstream.repo`
-- `/etc/yum.repos.d/epel.repo`
-
-## Docker Configuration
-
-- Creates `/etc/docker/daemon.json` with internal registry mirrors
-- Enables Docker service
-- Tests pulling images from internal mirror
-
-## Verification
-
-The playbook includes verification steps to ensure all packages are installed from internal mirrors only.
+| Repo | Internal URL |
+|------|-------------|
+| BaseOS | https://dnf.cloudinative.com/almalinux-baseos/ |
+| AppStream | https://dnf.cloudinative.com/almalinux-appstream/ |
+| EPEL 9 | https://dnf.cloudinative.com/epel-proxy/ |
+| Docker CE | https://dnf.cloudinative.com/docker-ce/linux/centos/$releasever/$basearch/stable/ |
+| Docker Registry | https://docker.cloudinative.com |

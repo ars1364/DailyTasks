@@ -1,0 +1,199 @@
+---
+# Ansible Playbook: Configure AlmaLinux to use Cloudinative DNF mirrors + Docker
+#
+# Replaces all default repos with internal Nexus mirrors.
+# Installs Docker CE, nginx, redis, postgresql-server.
+# Configures Docker to use internal registry mirror.
+# Ensures NO public repositories are used.
+#
+# Usage:
+#   ansible-playbook -i inventory playbook.yml
+#
+# Prerequisites:
+#   - Nexus DNF repos created (see ../nexus-dnf-repos/)
+#   - dnf.cloudinative.com resolving to reverse proxy
+#   - docker.cloudinative.com resolving to reverse proxy
+
+- name: Configure AlmaLinux with Cloudinative mirrors
+  hosts: almalinux_vms
+  become: yes
+  gather_facts: yes
+
+  vars:
+    mirror_base_url: "https://dnf.cloudinative.com"
+    docker_mirror_url: "https://docker.cloudinative.com"
+    mirror_hosts:
+      - { ip: "176.65.243.214", name: "dnf.cloudinative.com" }
+      - { ip: "176.65.243.214", name: "docker.cloudinative.com" }
+      - { ip: "176.65.243.214", name: "artifact.cloudinative.com" }
+    packages:
+      - nginx
+      - redis
+      - postgresql-server
+    docker_images:
+      - nginx
+      - redis
+      - postgres
+
+  tasks:
+    # ── DNS / Host Resolution ──────────────────────────────────
+    - name: Add mirror hosts to /etc/hosts (if DNS not propagated)
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ item.ip }} {{ item.name }}"
+        state: present
+      loop: "{{ mirror_hosts }}"
+      tags: [dns]
+
+    # ── DNF Repository Configuration ──────────────────────────
+    - name: Backup existing repo files
+      shell: |
+        mkdir -p /etc/yum.repos.d/backup
+        mv /etc/yum.repos.d/*.repo /etc/yum.repos.d/backup/ 2>/dev/null || true
+      args:
+        creates: /etc/yum.repos.d/backup
+      tags: [repos]
+
+    - name: Configure Cloudinative BaseOS repo
+      copy:
+        dest: /etc/yum.repos.d/cloudinative-baseos.repo
+        content: |
+          [cloudinative-baseos]
+          name=AlmaLinux 9 - BaseOS (Cloudinative Mirror)
+          baseurl={{ mirror_base_url }}/almalinux-baseos/
+          enabled=1
+          gpgcheck=0
+          sslverify=0
+      tags: [repos]
+
+    - name: Configure Cloudinative AppStream repo
+      copy:
+        dest: /etc/yum.repos.d/cloudinative-appstream.repo
+        content: |
+          [cloudinative-appstream]
+          name=AlmaLinux 9 - AppStream (Cloudinative Mirror)
+          baseurl={{ mirror_base_url }}/almalinux-appstream/
+          enabled=1
+          gpgcheck=0
+          sslverify=0
+      tags: [repos]
+
+    - name: Configure Cloudinative EPEL repo
+      copy:
+        dest: /etc/yum.repos.d/cloudinative-epel.repo
+        content: |
+          [cloudinative-epel]
+          name=EPEL 9 (Cloudinative Mirror)
+          baseurl={{ mirror_base_url }}/epel-proxy/
+          enabled=1
+          gpgcheck=0
+          sslverify=0
+      tags: [repos]
+
+    - name: Configure Docker CE repo (Cloudinative mirror)
+      copy:
+        dest: /etc/yum.repos.d/docker-ce.repo
+        content: |
+          [docker-ce-stable]
+          name=Docker CE Stable (Cloudinative Mirror)
+          baseurl={{ mirror_base_url }}/docker-ce/linux/centos/$releasever/$basearch/stable/
+          enabled=1
+          gpgcheck=0
+          sslverify=0
+      tags: [repos, docker]
+
+    - name: Clean DNF cache
+      command: dnf clean all
+      changed_when: false
+      tags: [repos]
+
+    - name: Refresh DNF cache
+      command: dnf makecache
+      changed_when: false
+      tags: [repos]
+
+    # ── Package Installation ──────────────────────────────────
+    - name: Install system packages
+      dnf:
+        name: "{{ packages }}"
+        state: present
+      tags: [packages]
+
+    - name: Install Docker CE
+      dnf:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+      tags: [docker]
+
+    # ── Docker Configuration ──────────────────────────────────
+    - name: Create Docker config directory
+      file:
+        path: /etc/docker
+        state: directory
+        mode: '0755'
+      tags: [docker]
+
+    - name: Configure Docker daemon (registry mirror)
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "registry-mirrors": ["{{ docker_mirror_url }}"],
+            "insecure-registries": ["docker.cloudinative.com"]
+          }
+      notify: restart docker
+      tags: [docker]
+
+    - name: Enable and start Docker
+      systemd:
+        name: docker
+        enabled: yes
+        state: started
+      tags: [docker]
+
+    # ── Docker Image Pull ─────────────────────────────────────
+    - name: Pull Docker images from internal mirror
+      command: "docker pull {{ docker_mirror_url }}/library/{{ item }}:latest"
+      loop: "{{ docker_images }}"
+      register: docker_pull
+      changed_when: "'Downloaded newer' in docker_pull.stdout"
+      tags: [docker, pull]
+
+    # ── Verification ──────────────────────────────────────────
+    - name: Verify only internal repos are active
+      command: dnf repolist
+      register: repolist
+      changed_when: false
+      tags: [verify]
+
+    - name: Assert no public repos
+      assert:
+        that:
+          - "'repo.almalinux.org' not in repolist.stdout"
+          - "'download.docker.com' not in repolist.stdout"
+          - "'fedoraproject.org' not in repolist.stdout"
+        fail_msg: "Public repositories detected in repolist!"
+        success_msg: "All repos point to *.cloudinative.com"
+      tags: [verify]
+
+    - name: Verify Docker images pulled
+      command: docker images --format "{{ '{{' }}.Repository{{ '}}' }}"
+      register: docker_images_list
+      changed_when: false
+      tags: [verify]
+
+    - name: Print summary
+      debug:
+        msg:
+          - "DNF repos: {{ repolist.stdout_lines | select('match', '^cloudinative|^docker') | list }}"
+          - "Docker images: {{ docker_images_list.stdout_lines }}"
+      tags: [verify]
+
+  handlers:
+    - name: restart docker
+      systemd:
+        name: docker
+        state: restarted

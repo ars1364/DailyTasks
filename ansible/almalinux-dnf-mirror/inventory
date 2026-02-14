@@ -1,6 +1,4 @@
 [almalinux_vms]
-46.245.69.219 ansible_user=almalinux ansible_ssh_private_key_file=/Users/macbookpro/openstacktasks/id_ed25519 ansible_ssh_common_args='-o StrictHostKeyChecking=no'
-
-# Alternative users to try:
-# 46.245.69.219 ansible_user=cloud-user ansible_ssh_private_key_file=/Users/macbookpro/openstacktasks/id_ed25519
-# 46.245.69.219 ansible_user=root ansible_ssh_private_key_file=/Users/macbookpro/openstacktasks/id_ed25519
+# Add target VM IPs here. SSH via server01 as jump host.
+# Example:
+# 46.245.69.216 ansible_user=almalinux ansible_ssh_common_args='-o ProxyCommand="ssh -W %h:%p -i /path/to/key xadmin@172.40.30.21"'

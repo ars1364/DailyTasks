@@ -1,0 +1,125 @@
+---
+# Ansible Playbook: Add DNF/YUM proxy repos to Nexus
+# Creates AlmaLinux BaseOS, AppStream, and EPEL proxy repositories
+# and grants anonymous read access.
+#
+# Usage:
+#   ansible-playbook playbook.yml
+#
+# Variables (override via -e or vars file):
+#   nexus_url, nexus_user, nexus_password
+
+- name: Create DNF proxy repositories in Nexus
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars:
+    nexus_url: "https://artifact.cloudinative.com"
+    nexus_user: "admin"
+    nexus_password: "{{ lookup('env', 'NEXUS_PASSWORD') | default('changeme', true) }}"
+    repos:
+      - name: almalinux-baseos
+        remote_url: "https://repo.almalinux.org/almalinux/9/BaseOS/x86_64/os/"
+      - name: almalinux-appstream
+        remote_url: "https://repo.almalinux.org/almalinux/9/AppStream/x86_64/os/"
+      - name: epel-proxy
+        remote_url: "https://dl.fedoraproject.org/pub/epel/9/Everything/x86_64/"
+      - name: docker-ce
+        remote_url: "https://download.docker.com/linux/centos/"
+
+  tasks:
+    - name: Check if repository already exists
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/repositories/yum/proxy/{{ item.name }}"
+        method: GET
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 404]
+      loop: "{{ repos }}"
+      register: repo_check
+
+    - name: Create YUM proxy repositories
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/repositories/yum/proxy"
+        method: POST
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        body_format: json
+        body:
+          name: "{{ item.item.name }}"
+          online: true
+          storage:
+            blobStoreName: default
+            strictContentTypeValidation: false
+          proxy:
+            remoteUrl: "{{ item.item.remote_url }}"
+            contentMaxAge: 1440
+            metadataMaxAge: 1440
+          negativeCache:
+            enabled: true
+            timeToLive: 1440
+          httpClient:
+            blocked: false
+            autoBlock: true
+        headers:
+          Content-Type: application/json
+        status_code: [201]
+      loop: "{{ repo_check.results }}"
+      when: item.status == 404
+      register: repo_create
+
+    - name: Get current anonymous role privileges
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/security/roles/anonymous-proxy-only"
+        method: GET
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200]
+      register: anon_role
+
+    - name: Build new privilege list
+      set_fact:
+        new_privileges: >-
+          {{ anon_role.json.privileges | union(
+            repos | map(attribute='name') | map('regex_replace', '^(.*)$', 'nx-repository-view-yum-\1-read') | list
+            + repos | map(attribute='name') | map('regex_replace', '^(.*)$', 'nx-repository-view-yum-\1-browse') | list
+            + ['nx-repository-view-raw-docker-ce-read', 'nx-repository-view-raw-docker-ce-browse']
+          ) }}
+
+    - name: Update anonymous role with yum repo privileges
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/security/roles/anonymous-proxy-only"
+        method: PUT
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        body_format: json
+        body:
+          id: anonymous-proxy-only
+          name: "{{ anon_role.json.name }}"
+          description: "{{ anon_role.json.description }}"
+          privileges: "{{ new_privileges }}"
+          roles: []
+        status_code: [204]
+
+    - name: Verify anonymous access
+      uri:
+        url: "{{ nexus_url }}/repository/{{ item.name }}/repodata/repomd.xml"
+        method: GET
+        validate_certs: no
+        status_code: [200]
+      loop: "{{ repos | selectattr('name', 'ne', 'docker-ce') | list }}"
+      register: verify
+
+    - name: Report results
+      debug:
+        msg: "{{ item.item.name }}: {{ 'OK' if item.status == 200 else 'FAILED' }}"
+      loop: "{{ verify.results }}"
