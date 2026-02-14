@@ -1,0 +1,103 @@
+---
+- name: Configure AlmaLinux 9 with Cloudinative repos and install packages
+  hosts: all
+  become: true
+  vars_files:
+    - vars.yml
+
+  tasks:
+    # Step 1: Disable all default AlmaLinux repos
+    - name: Disable default AlmaLinux repos
+      ansible.builtin.shell: |
+        sed -i 's/enabled=1/enabled=0/g' /etc/yum.repos.d/almalinux*.repo
+      args:
+        warn: false
+
+    # Step 2: Configure Nexus proxy repos
+    - name: Add Cloudinative repos
+      ansible.builtin.yum_repository:
+        name: "{{ item.name }}"
+        description: "{{ item.description }}"
+        baseurl: "{{ item.baseurl }}"
+        gpgcheck: "{{ item.gpgcheck | default(true) }}"
+        gpgkey: "{{ item.gpgkey | default(omit) }}"
+        enabled: true
+        sslverify: true
+        file: "cloudinative-{{ item.name }}"
+      loop: "{{ almalinux_repos }}"
+
+    # Step 3: Clean DNF cache
+    - name: Clean DNF cache
+      ansible.builtin.command: dnf clean all
+
+    # Step 4: Install packages
+    - name: Install required packages
+      ansible.builtin.dnf:
+        name: "{{ packages }}"
+        state: present
+
+    # Step 5: Initialize PostgreSQL
+    - name: Initialize PostgreSQL database
+      ansible.builtin.command: postgresql-setup --initdb
+      args:
+        creates: /var/lib/pgsql/data/PG_VERSION
+
+    # Step 6: Enable and start services
+    - name: Enable and start services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop: "{{ services }}"
+
+    - name: Enable and start PostgreSQL
+      ansible.builtin.systemd:
+        name: postgresql
+        state: started
+        enabled: true
+
+    # Step 7: Verify installations
+    - name: Verify Docker
+      ansible.builtin.command: docker --version
+      register: docker_ver
+      changed_when: false
+
+    - name: Verify Nginx
+      ansible.builtin.command: nginx -v
+      register: nginx_ver
+      changed_when: false
+
+    - name: Verify Redis
+      ansible.builtin.command: redis-cli ping
+      register: redis_ping
+      changed_when: false
+
+    - name: Verify PostgreSQL
+      ansible.builtin.command: psql --version
+      register: psql_ver
+      changed_when: false
+
+    - name: Verify repos
+      ansible.builtin.command: dnf repolist
+      register: repolist
+      changed_when: false
+
+    - name: Print verification results
+      ansible.builtin.debug:
+        msg: |
+          Docker: {{ docker_ver.stdout }}
+          Nginx: {{ nginx_ver.stderr }}
+          Redis: {{ redis_ping.stdout }}
+          PostgreSQL: {{ psql_ver.stdout }}
+          Repos:
+          {{ repolist.stdout }}
+
+    - name: Ensure no public URLs in repo configs
+      ansible.builtin.shell: |
+        grep -rl 'repo.almalinux.org\|mirror.almalinux.org\|download.fedoraproject.org\|download.docker.com' /etc/yum.repos.d/ --include='*.repo' | grep -v '.bak' || echo "CLEAN - no public URLs found"
+      register: public_url_check
+      changed_when: false
+
+    - name: Show public URL check
+      ansible.builtin.debug:
+        var: public_url_check.stdout

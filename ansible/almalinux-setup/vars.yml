@@ -1,0 +1,45 @@
+---
+# Repository configuration
+nexus_yum_base_url: "https://yum.cloudinative.com/repository"
+nexus_docker_base_url: "https://apt.cloudinative.com/repository/docker-ce"
+
+# AlmaLinux 9 base repos via Nexus proxy
+almalinux_repos:
+  - name: almalinux-baseos
+    description: "AlmaLinux 9 - BaseOS (Nexus Proxy)"
+    baseurl: "{{ nexus_yum_base_url }}/almalinux-baseos/9/$basearch/os/"
+    gpgcheck: true
+    gpgkey: "https://repo.almalinux.org/almalinux/RPM-GPG-KEY-AlmaLinux-9"
+
+  - name: almalinux-appstream
+    description: "AlmaLinux 9 - AppStream (Nexus Proxy)"
+    baseurl: "{{ nexus_yum_base_url }}/almalinux-appstream/9/$basearch/os/"
+    gpgcheck: true
+    gpgkey: "https://repo.almalinux.org/almalinux/RPM-GPG-KEY-AlmaLinux-9"
+
+  - name: epel
+    description: "EPEL 9 (Nexus Proxy)"
+    baseurl: "{{ nexus_yum_base_url }}/epel/9/Everything/$basearch/"
+    gpgcheck: true
+    gpgkey: "https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-9"
+
+  - name: docker-ce-stable
+    description: "Docker CE Stable (Nexus Proxy)"
+    baseurl: "{{ nexus_docker_base_url }}/linux/centos/$releasever/$basearch/stable"
+    gpgcheck: true
+    gpgkey: "https://download.docker.com/linux/centos/gpg"
+
+# Packages to install
+packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - postgresql-server
+  - nginx
+  - redis
+
+# Services to enable
+services:
+  - docker
+  - nginx
+  - redis
