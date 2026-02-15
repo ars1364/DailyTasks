@@ -3,16 +3,31 @@ nexus_url: "http://127.0.0.1:8081"
 nexus_admin_user: "admin"
 nexus_admin_password: "{{ lookup('env', 'NEXUS_ADMIN_PASSWORD') | default('Cl0ud1n@t1ve!Nxs2026', true) }}"
 
-# Mirror settings
-docker_upstream_url: "https://download.docker.com"
-mirror_base_url: "https://apt.cloudinative.com/repository/docker-ce"
+# Mirror base domain
+mirror_domain: "cloudinative.com"
 
-# Repo names
+# Clean mirror subdomains (swap domain, keep path)
+# archive.ubuntu.com   -> archive.cloudinative.com
+# security.ubuntu.com  -> security.cloudinative.com
+# download.docker.com  -> download.cloudinative.com
+# registry-1.docker.io -> docker.cloudinative.com
+
+# Upstream URLs
+docker_upstream_url: "https://download.docker.com"
+ubuntu_upstream_url: "http://archive.ubuntu.com/ubuntu"
+ubuntu_security_upstream_url: "http://security.ubuntu.com/ubuntu"
+
+# Nexus repo names
 docker_ce_repo: "docker-ce"
 docker_gpg_repo: "docker-gpg"
+ubuntu_proxy_repo: "ubuntu-proxy"
+ubuntu_security_proxy_repo: "ubuntu-security-proxy"
 
 # Anonymous role to update
 anonymous_role_id: "anonymous-proxy-only"
 
 # Nginx config path on artifact VM
 nginx_conf_path: "/etc/nginx/nginx.conf"
+
+# Reverse proxy IP (all mirror subdomains point here)
+reverse_proxy_ip: "176.65.243.214"

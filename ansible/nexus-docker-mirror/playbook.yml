@@ -1,20 +1,112 @@
 ---
-# Nexus Docker Mirror Setup
-# Creates Nexus repos, uploads GPG key + install script, configures nginx
+# Nexus Artifact Mirror Setup
+# Configures Nexus as a clean mirror for Ubuntu APT, Docker CE, and Docker Registry.
+#
+# Clean URL mapping (users just swap the domain, path stays the same):
+#   archive.ubuntu.com/ubuntu/       -> archive.cloudinative.com/ubuntu/
+#   security.ubuntu.com/ubuntu/      -> security.cloudinative.com/ubuntu/
+#   download.docker.com/linux/ubuntu -> download.cloudinative.com/linux/ubuntu
+#   registry-1.docker.io             -> docker.cloudinative.com
 #
 # Usage:
 #   ansible-playbook playbook.yml -i inventory.yml
 #   # Or override nexus password:
 #   NEXUS_ADMIN_PASSWORD=secret ansible-playbook playbook.yml -i inventory.yml
 
-- name: Setup Docker CE mirror on Nexus
+- name: Setup clean artifact mirrors on Nexus
   hosts: artifact
   become: false
   vars_files:
     - vars.yml
 
   tasks:
-    # ── Step 1: Create docker-ce raw proxy repo ──────────────────────
+    # ════════════════════════════════════════════════════════════════
+    # NEXUS REPOSITORIES
+    # ════════════════════════════════════════════════════════════════
+
+    # ── Ubuntu APT proxy ─────────────────────────────────────────
+    - name: Check if ubuntu-proxy repo exists
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/repositories/apt/proxy/{{ ubuntu_proxy_repo }}"
+        method: GET
+        user: "{{ nexus_admin_user }}"
+        password: "{{ nexus_admin_password }}"
+        force_basic_auth: true
+        status_code: [200, 404]
+      register: ubuntu_check
+
+    - name: Create ubuntu-proxy APT repository
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/repositories/apt/proxy"
+        method: POST
+        user: "{{ nexus_admin_user }}"
+        password: "{{ nexus_admin_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          name: "{{ ubuntu_proxy_repo }}"
+          online: true
+          storage:
+            blobStoreName: default
+            strictContentTypeValidation: true
+          proxy:
+            remoteUrl: "{{ ubuntu_upstream_url }}"
+            contentMaxAge: 1440
+            metadataMaxAge: 1440
+          negativeCache:
+            enabled: true
+            timeToLive: 1440
+          httpClient:
+            blocked: false
+            autoBlock: true
+          apt:
+            distribution: noble
+            flat: false
+        status_code: 201
+      when: ubuntu_check.status == 404
+
+    # ── Ubuntu Security APT proxy ────────────────────────────────
+    - name: Check if ubuntu-security-proxy repo exists
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/repositories/apt/proxy/{{ ubuntu_security_proxy_repo }}"
+        method: GET
+        user: "{{ nexus_admin_user }}"
+        password: "{{ nexus_admin_password }}"
+        force_basic_auth: true
+        status_code: [200, 404]
+      register: ubuntu_sec_check
+
+    - name: Create ubuntu-security-proxy APT repository
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/repositories/apt/proxy"
+        method: POST
+        user: "{{ nexus_admin_user }}"
+        password: "{{ nexus_admin_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          name: "{{ ubuntu_security_proxy_repo }}"
+          online: true
+          storage:
+            blobStoreName: default
+            strictContentTypeValidation: true
+          proxy:
+            remoteUrl: "{{ ubuntu_security_upstream_url }}"
+            contentMaxAge: 1440
+            metadataMaxAge: 1440
+          negativeCache:
+            enabled: true
+            timeToLive: 1440
+          httpClient:
+            blocked: false
+            autoBlock: true
+          apt:
+            distribution: noble-security
+            flat: false
+        status_code: 201
+      when: ubuntu_sec_check.status == 404
+
+    # ── Docker CE raw proxy ──────────────────────────────────────
     - name: Check if docker-ce repo exists
       uri:
         url: "{{ nexus_url }}/service/rest/v1/repositories/raw/proxy/{{ docker_ce_repo }}"
@@ -52,7 +144,7 @@
         status_code: 201
       when: docker_ce_check.status == 404
 
-    # ── Step 2: Create docker-gpg raw hosted repo ────────────────────
+    # ── Docker GPG raw hosted ────────────────────────────────────
     - name: Check if docker-gpg repo exists
       uri:
         url: "{{ nexus_url }}/service/rest/v1/repositories/raw/hosted/{{ docker_gpg_repo }}"
@@ -81,7 +173,10 @@
         status_code: 201
       when: docker_gpg_check.status == 404
 
-    # ── Step 3: Download and upload Docker GPG key ───────────────────
+    # ════════════════════════════════════════════════════════════════
+    # GPG KEY & INSTALL SCRIPT
+    # ════════════════════════════════════════════════════════════════
+
     - name: Download Docker GPG key
       get_url:
         url: "{{ docker_upstream_url }}/linux/ubuntu/gpg"
@@ -99,9 +194,7 @@
         headers:
           Content-Type: application/octet-stream
         status_code: [201, 400]
-        # 400 = already exists, which is fine
 
-    # ── Step 4: Download, patch, and upload install script ───────────
     - name: Download official get-docker.sh
       get_url:
         url: "https://get.docker.com"
@@ -110,7 +203,7 @@
 
     - name: Patch install script to use local mirror
       copy:
-        content: "{{ lookup('file', '/tmp/get-docker-original.sh') | regex_replace('DEFAULT_DOWNLOAD_URL=\"https://download.docker.com\"', 'DEFAULT_DOWNLOAD_URL=\"' + mirror_base_url + '\"') }}"
+        content: "{{ lookup('file', '/tmp/get-docker-original.sh') | regex_replace('DEFAULT_DOWNLOAD_URL=\"https://download.docker.com\"', 'DEFAULT_DOWNLOAD_URL=\"https://download.' + mirror_domain + '\"') }}"
         dest: /tmp/get-docker.sh
         mode: '0644'
       delegate_to: localhost
@@ -134,7 +227,10 @@
           Content-Type: text/plain
         status_code: [201, 400]
 
-    # ── Step 5: Update anonymous role with new repo privileges ───────
+    # ════════════════════════════════════════════════════════════════
+    # ANONYMOUS ACCESS
+    # ════════════════════════════════════════════════════════════════
+
     - name: Get current anonymous role
       uri:
         url: "{{ nexus_url }}/service/rest/v1/security/roles/{{ anonymous_role_id }}"
@@ -152,7 +248,11 @@
             'nx-repository-view-raw-' + docker_ce_repo + '-read',
             'nx-repository-view-raw-' + docker_ce_repo + '-browse',
             'nx-repository-view-raw-' + docker_gpg_repo + '-read',
-            'nx-repository-view-raw-' + docker_gpg_repo + '-browse'
+            'nx-repository-view-raw-' + docker_gpg_repo + '-browse',
+            'nx-repository-view-apt-' + ubuntu_proxy_repo + '-read',
+            'nx-repository-view-apt-' + ubuntu_proxy_repo + '-browse',
+            'nx-repository-view-apt-' + ubuntu_security_proxy_repo + '-read',
+            'nx-repository-view-apt-' + ubuntu_security_proxy_repo + '-browse'
           ]) }}
 
     - name: Update anonymous role with new privileges
@@ -172,73 +272,58 @@
         status_code: 204
       when: updated_privileges | length > anon_role.json.privileges | length
 
-    # ── Step 6: Update nginx config ──────────────────────────────────
-    - name: Check if docker-ce nginx location already exists
-      command: grep -c 'repository/docker-ce' {{ nginx_conf_path }}
-      register: nginx_docker_check
-      ignore_errors: true
-      changed_when: false
+    # ════════════════════════════════════════════════════════════════
+    # NGINX (artifact VM)
+    # ════════════════════════════════════════════════════════════════
 
-    - name: Add docker-ce and docker-gpg nginx locations
+    - name: Deploy artifact nginx config
       become: true
-      blockinfile:
-        path: "{{ nginx_conf_path }}"
-        insertbefore: "location / \\{\\s*\n\\s*return 200"
-        marker: "        # {mark} ANSIBLE MANAGED - Docker CE Mirror"
-        block: |2
-                  location /repository/docker-ce/ {
-                      proxy_pass http://127.0.0.1:8081/repository/docker-ce/;
-                      proxy_read_timeout 600;
-                      proxy_buffering off;
-                  }
-
-                  location /repository/docker-gpg/ {
-                      proxy_pass http://127.0.0.1:8081/repository/docker-gpg/;
-                      proxy_read_timeout 600;
-                      proxy_buffering off;
-                  }
-      when: nginx_docker_check.rc != 0 or nginx_docker_check.stdout == "0"
+      template:
+        src: templates/nginx-mirrors.conf.j2
+        dest: "{{ nginx_conf_path }}"
+        backup: true
       notify: reload nginx
 
-    - name: Update repo list in catch-all response
-      become: true
-      replace:
-        path: "{{ nginx_conf_path }}"
-        regexp: '"repos":\s*\[([^\]]*)\]'
-        replace: '"repos": ["ubuntu", "ubuntu-security", "kubernetes", "docker-ce", "docker-gpg"]'
-      notify: reload nginx
+    # ════════════════════════════════════════════════════════════════
+    # VERIFY
+    # ════════════════════════════════════════════════════════════════
 
-    # ── Step 7: Verify ───────────────────────────────────────────────
-    - name: Verify GPG key accessible
+    - name: Verify Ubuntu APT proxy
       uri:
-        url: "{{ nexus_url }}/repository/{{ docker_gpg_repo }}/docker.gpg"
+        url: "{{ nexus_url }}/repository/{{ ubuntu_proxy_repo }}/dists/noble/InRelease"
         method: GET
         status_code: 200
-      register: gpg_verify
+      register: ubuntu_verify
 
-    - name: Verify install script accessible
+    - name: Verify Ubuntu Security APT proxy
       uri:
-        url: "{{ nexus_url }}/repository/{{ docker_gpg_repo }}/get-docker.sh"
+        url: "{{ nexus_url }}/repository/{{ ubuntu_security_proxy_repo }}/dists/noble-security/InRelease"
         method: GET
         status_code: 200
-      register: script_verify
+      register: ubuntu_sec_verify
 
-    - name: Verify docker-ce proxy works
+    - name: Verify Docker CE proxy
       uri:
         url: "{{ nexus_url }}/repository/{{ docker_ce_repo }}/linux/ubuntu/gpg"
         method: GET
         status_code: 200
-      register: proxy_verify
+      register: docker_verify
 
     - name: Print verification results
       debug:
         msg: |
-          ✓ GPG key: {{ gpg_verify.content_length }} bytes
-          ✓ Install script: {{ script_verify.content_length }} bytes
-          ✓ Docker CE proxy: {{ proxy_verify.content_length }} bytes
-          
-          Install command for end users:
-            curl -fsSL https://apt.cloudinative.com/repository/docker-gpg/get-docker.sh | bash
+          All mirrors verified successfully.
+
+          Clean URL mapping (just swap the domain):
+            archive.ubuntu.com   -> archive.{{ mirror_domain }}
+            security.ubuntu.com  -> security.{{ mirror_domain }}
+            download.docker.com  -> download.{{ mirror_domain }}
+            registry-1.docker.io -> docker.{{ mirror_domain }}
+
+          Quick Docker install:
+            curl -fsSL https://download.{{ mirror_domain }}/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.asc
+            echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.{{ mirror_domain }}/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list
+            sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io
 
   handlers:
     - name: reload nginx
