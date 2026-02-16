@@ -1,0 +1,44 @@
+# OpenStack connection
+os_auth_url: "http://172.30.204.10:5000"
+os_username: "admin"
+os_password: "{{ lookup('env', 'OS_PASSWORD') | default('uSmHfSL92UMI3x88L9oQEp6eb0YYt9', true) }}"
+os_project_name: "VPC_ARS"
+os_domain: "Default"
+os_region: "dc1"
+os_interface: "internal"
+
+# VM defaults
+vm_name: "abreina"
+vm_flavor: "C2R4"
+vm_image: "Ubuntu24"
+vm_volume_size: 25
+vm_network: "k8s-network"
+vm_keypair: "mac-admin"
+vm_security_group: "sg-{{ vm_name }}"
+
+# Security group rules
+sg_rules:
+  - { protocol: tcp, port: 22, cidr: "0.0.0.0/0" }
+  - { protocol: tcp, port: 80, cidr: "0.0.0.0/0" }
+  - { protocol: tcp, port: 443, cidr: "0.0.0.0/0" }
+  - { protocol: icmp, port: -1, cidr: "0.0.0.0/0" }
+
+# Floating IP
+assign_fip: true
+fip_network: "Provider"
+
+# Cloudinative APT mirrors
+apt_sources: |
+  deb http://archive.cloudinative.com/ubuntu/ noble main restricted universe multiverse
+  deb http://archive.cloudinative.com/ubuntu/ noble-updates main restricted universe multiverse
+  deb http://security.cloudinative.com/ubuntu/ noble-security main restricted universe multiverse
+
+# Base packages
+base_packages:
+  - curl
+  - wget
+  - git
+  - vim
+  - htop
+  - net-tools
+  - jq

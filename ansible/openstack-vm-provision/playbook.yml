@@ -1,0 +1,111 @@
+---
+- name: Provision OpenStack VM
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Create security group
+      openstack.cloud.security_group:
+        auth:
+          auth_url: "{{ os_auth_url }}"
+          username: "{{ os_username }}"
+          password: "{{ os_password }}"
+          project_name: "{{ os_project_name }}"
+          project_domain_name: "{{ os_domain }}"
+          user_domain_name: "{{ os_domain }}"
+        region_name: "{{ os_region }}"
+        interface: "{{ os_interface }}"
+        name: "{{ vm_security_group }}"
+        description: "Security group for {{ vm_name }}"
+        state: present
+      register: sg
+
+    - name: Add security group rules
+      openstack.cloud.security_group_rule:
+        auth:
+          auth_url: "{{ os_auth_url }}"
+          username: "{{ os_username }}"
+          password: "{{ os_password }}"
+          project_name: "{{ os_project_name }}"
+          project_domain_name: "{{ os_domain }}"
+          user_domain_name: "{{ os_domain }}"
+        region_name: "{{ os_region }}"
+        interface: "{{ os_interface }}"
+        security_group: "{{ vm_security_group }}"
+        protocol: "{{ item.protocol }}"
+        port_range_min: "{{ item.port if item.protocol != 'icmp' else omit }}"
+        port_range_max: "{{ item.port if item.protocol != 'icmp' else omit }}"
+        remote_ip_prefix: "{{ item.cidr }}"
+        state: present
+      loop: "{{ sg_rules }}"
+
+    - name: Create VM (boot from volume)
+      openstack.cloud.server:
+        auth:
+          auth_url: "{{ os_auth_url }}"
+          username: "{{ os_username }}"
+          password: "{{ os_password }}"
+          project_name: "{{ os_project_name }}"
+          project_domain_name: "{{ os_domain }}"
+          user_domain_name: "{{ os_domain }}"
+        region_name: "{{ os_region }}"
+        interface: "{{ os_interface }}"
+        name: "{{ vm_name }}"
+        flavor: "{{ vm_flavor }}"
+        image: "{{ vm_image }}"
+        boot_from_volume: true
+        volume_size: "{{ vm_volume_size }}"
+        terminate_volume: true
+        network: "{{ vm_network }}"
+        key_name: "{{ vm_keypair }}"
+        security_groups:
+          - "{{ vm_security_group }}"
+        auto_ip: "{{ assign_fip }}"
+        wait: true
+        timeout: 300
+        state: present
+      register: server
+
+    - name: Show VM details
+      debug:
+        msg:
+          - "Name: {{ server.server.name }}"
+          - "ID: {{ server.server.id }}"
+          - "Status: {{ server.server.status }}"
+          - "Private IP: {{ server.server.private_v4 }}"
+          - "Public IP: {{ server.server.public_v4 | default('N/A') }}"
+
+    - name: Wait for SSH
+      wait_for:
+        host: "{{ server.server.public_v4 | default(server.server.private_v4) }}"
+        port: 22
+        delay: 10
+        timeout: 120
+      when: server.changed
+
+- name: Configure VM
+  hosts: "{{ vm_name | default('abreina') }}"
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Configure APT sources (Cloudinative mirrors)
+      copy:
+        content: "{{ apt_sources }}"
+        dest: /etc/apt/sources.list
+        mode: '0644'
+
+    - name: Remove cloud-init sources
+      file:
+        path: /etc/apt/sources.list.d/ubuntu.sources
+        state: absent
+
+    - name: Update apt cache
+      apt:
+        update_cache: true
+
+    - name: Install base packages
+      apt:
+        name: "{{ base_packages }}"
+        state: present
