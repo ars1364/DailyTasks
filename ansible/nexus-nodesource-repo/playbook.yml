@@ -1,0 +1,289 @@
+---
+# Ansible Playbook: Add NodeSource Node.js 22.x APT proxy to Nexus
+# Creates APT proxy repo, DNS record, and reverse proxy config.
+#
+# Usage:
+#   export NEXUS_PASSWORD='your-nexus-admin-password'
+#   ansible-playbook -i inventory.yml playbook.yml
+
+- name: Create NodeSource APT proxy repository in Nexus
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars:
+    nexus_url: "https://artifact.cloudinative.com"
+    nexus_user: "admin"
+    nexus_password: "{{ lookup('env', 'NEXUS_PASSWORD') | default('changeme', true) }}"
+    repo_name: "nodesource-node22"
+    remote_url: "https://deb.nodesource.com/node_22.x"
+    anon_role: "anonymous-proxy-only"
+
+  tasks:
+    - name: Check if repository already exists
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/repositories/apt/proxy/{{ repo_name }}"
+        method: GET
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 404]
+      register: repo_check
+
+    - name: Create APT proxy repository
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/repositories/apt/proxy"
+        method: POST
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        body_format: json
+        body:
+          name: "{{ repo_name }}"
+          online: true
+          storage:
+            blobStoreName: default
+            strictContentTypeValidation: false
+          proxy:
+            remoteUrl: "{{ remote_url }}"
+            contentMaxAge: 1440
+            metadataMaxAge: 1440
+          negativeCache:
+            enabled: true
+            timeToLive: 1440
+          httpClient:
+            blocked: false
+            autoBlock: true
+          apt:
+            distribution: "nodistro"
+            flat: false
+        headers:
+          Content-Type: application/json
+        status_code: [201]
+      when: repo_check.status == 404
+
+    - name: Get current anonymous role privileges
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/security/roles/{{ anon_role }}"
+        method: GET
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200]
+      register: current_role
+
+    - name: Build updated privilege list
+      set_fact:
+        updated_privileges: >-
+          {{ current_role.json.privileges | union([
+            'nx-repository-view-apt-' + repo_name + '-read',
+            'nx-repository-view-apt-' + repo_name + '-browse'
+          ]) }}
+
+    - name: Update anonymous role with APT repo privileges
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/security/roles/{{ anon_role }}"
+        method: PUT
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        body_format: json
+        body:
+          id: "{{ anon_role }}"
+          name: "{{ current_role.json.name }}"
+          description: "{{ current_role.json.description }}"
+          privileges: "{{ updated_privileges }}"
+          roles: []
+        status_code: [204]
+      when: >-
+        'nx-repository-view-apt-' + repo_name + '-read' not in current_role.json.privileges
+
+    - name: Download NodeSource GPG key
+      get_url:
+        url: "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key"
+        dest: "/tmp/nodesource-repo.gpg.key"
+        mode: "0644"
+
+    - name: Check if nodesource-gpg raw hosted repo exists
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/repositories/raw/hosted/nodesource-gpg"
+        method: GET
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 404]
+      register: gpg_repo_check
+
+    - name: Create nodesource-gpg raw hosted repo
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/repositories/raw/hosted"
+        method: POST
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        body_format: json
+        body:
+          name: "nodesource-gpg"
+          online: true
+          storage:
+            blobStoreName: default
+            strictContentTypeValidation: false
+            writePolicy: ALLOW
+        headers:
+          Content-Type: application/json
+        status_code: [201]
+      when: gpg_repo_check.status == 404
+
+    - name: Upload GPG key to Nexus raw hosted repo
+      command: >
+        curl -sf -u {{ nexus_user }}:{{ nexus_password }}
+        --upload-file /tmp/nodesource-repo.gpg.key
+        -k {{ nexus_url }}/repository/nodesource-gpg/nodesource-repo.gpg.key
+      register: gpg_upload
+      changed_when: gpg_upload.rc == 0
+
+    - name: Add anonymous privileges for GPG repo
+      set_fact:
+        gpg_privileges:
+          - "nx-repository-view-raw-nodesource-gpg-read"
+          - "nx-repository-view-raw-nodesource-gpg-browse"
+
+    - name: Get current anonymous role (for GPG repo)
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/security/roles/{{ anon_role }}"
+        method: GET
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200]
+      register: current_role_gpg
+
+    - name: Update anonymous role with GPG repo privileges
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/security/roles/{{ anon_role }}"
+        method: PUT
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        body_format: json
+        body:
+          id: "{{ anon_role }}"
+          name: "{{ current_role_gpg.json.name }}"
+          description: "{{ current_role_gpg.json.description }}"
+          privileges: "{{ current_role_gpg.json.privileges | union(gpg_privileges) }}"
+          roles: []
+        status_code: [204]
+      when: gpg_privileges[0] not in current_role_gpg.json.privileges
+
+    - name: Verify Nexus repo is accessible
+      uri:
+        url: "{{ nexus_url }}/repository/{{ repo_name }}/dists/nodistro/Release"
+        method: GET
+        validate_certs: no
+        status_code: [200]
+      register: verify
+      ignore_errors: yes
+
+    - name: Report Nexus result
+      debug:
+        msg: "Nexus repo {{ repo_name }}: {{ 'OK' if verify.status | default(0) == 200 else 'FAILED (may need first cache fetch)' }}"
+
+- name: Add DNS record for nodejs.cloudinative.com
+  hosts: dns_server
+  become: yes
+  gather_facts: no
+
+  vars:
+    zone_file: "/etc/bind/zones/db.cloudinative.com"
+    subdomain: "nodejs"
+    target_ip: "176.65.243.214"
+
+  tasks:
+    - name: Check if DNS record already exists
+      command: grep -c '{{ subdomain }}' {{ zone_file }}
+      register: dns_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Add A record to zone file
+      lineinfile:
+        path: "{{ zone_file }}"
+        insertafter: '^;.*proxy records|;.*Proxy|;.*A records'
+        line: "{{ subdomain }}        IN      A       {{ target_ip }}"
+        state: present
+      when: dns_check.stdout | default('0') | int == 0
+      register: dns_added
+
+    - name: Increment zone serial
+      shell: |
+        SERIAL=$(grep -oP '\d{10}' {{ zone_file }} | head -1)
+        NEW_SERIAL=$(( SERIAL + 1 ))
+        sed -i "s/$SERIAL/$NEW_SERIAL/" {{ zone_file }}
+      when: dns_added is changed
+
+    - name: Reload BIND9
+      service:
+        name: bind9
+        state: reloaded
+      when: dns_added is changed
+
+    - name: Verify DNS resolution
+      command: dig +short {{ subdomain }}.cloudinative.com @localhost
+      register: dns_verify
+      changed_when: false
+
+    - name: Report DNS result
+      debug:
+        msg: "DNS {{ subdomain }}.cloudinative.com -> {{ dns_verify.stdout }}"
+
+- name: Configure reverse proxy for nodejs.cloudinative.com
+  hosts: reverse_proxy
+  become: yes
+  gather_facts: no
+
+  tasks:
+    - name: Check if nginx site already exists
+      stat:
+        path: /etc/nginx/sites-enabled/nodejs-proxy
+      register: nginx_check
+
+    - name: Deploy nginx config
+      template:
+        src: templates/nodejs-proxy.conf.j2
+        dest: /etc/nginx/sites-enabled/nodejs-proxy
+        mode: "0644"
+      when: not nginx_check.stat.exists
+      register: nginx_deployed
+
+    - name: Test nginx configuration
+      command: nginx -t
+      when: nginx_deployed is changed
+      register: nginx_test
+
+    - name: Reload nginx
+      service:
+        name: nginx
+        state: reloaded
+      when: nginx_deployed is changed and nginx_test.rc == 0
+
+    - name: Verify HTTPS endpoint
+      uri:
+        url: "https://nodejs.cloudinative.com/dists/nodistro/Release"
+        method: GET
+        validate_certs: no
+        status_code: [200]
+      delegate_to: localhost
+      register: endpoint_verify
+      ignore_errors: yes
+
+    - name: Report endpoint result
+      debug:
+        msg: "Endpoint https://nodejs.cloudinative.com: {{ 'OK' if endpoint_verify.status | default(0) == 200 else 'FAILED (check proxy chain)' }}"
