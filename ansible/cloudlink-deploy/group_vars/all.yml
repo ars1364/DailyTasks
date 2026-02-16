@@ -1,0 +1,48 @@
+---
+# Domain
+domain: abreina.ir
+certbot_email: ars1364@gmail.com
+
+# App
+app_repo: "https://github.com/chjkh8113/CloudLink.git"
+app_dir: /home/ubuntu/CloudLink
+app_port: 3000
+
+# Docker
+docker_mirror: "https://docker.cloudinative.com"
+docker_bridge_subnet: "172.18.0.1/16"
+
+# APT mirrors (Cloudinative)
+apt_sources: |
+  deb http://archive.cloudinative.com/ubuntu/ noble main restricted universe multiverse
+  deb http://archive.cloudinative.com/ubuntu/ noble-updates main restricted universe multiverse
+  deb http://security.cloudinative.com/ubuntu/ noble-security main restricted universe multiverse
+
+# SSH keys to add (Ahmad)
+extra_ssh_keys:
+  - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDRIysTxBvNfhCmq6SvFuBlS6IF1DYAbEsw1JqJJirwYozhkX+NOQJF6/d4o69BG6vx1EriIHQQqOOBNAgGsJOKPsJTJTNLJ+jdzXB3BgWzztd6DImvPAL/vWG7yLK0wXnx4Q33KqzShdV153kLsf07BHGAKD32uJoHOltPyxpkT+nNynnC+AUQQ4UdBjTFifgQt2TkvA4OT5pcckkT7LxwF+Zq/OnLMZLb8hO4HV5Cj/CkuGL+Q9lv16R92DoRwoBIv8An1/ORvPIPTFvw/BNqF0dWUyzywivl2O4cxKg5BobqrH0iVc/4UQp7fod12DICne0QyZqDFJpoGR0jBVB7TF0bL/ZgI24f7fulROYqw+puaL2c+NcmCBDqeFgyZtIZuSRheozqLekRQQiIOtN1m6C9PplaIas4zVR4Z2pwgRxCd7rJsxDeQNiHRDP+SeuAECLAyLEabUOzzXCs9ozX+9u50KpeBbI+Ka8bhQo14j0ZfM4i8GQtQASZN12lM7E= ars1364@gmail.com"
+  - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCvFMJJLf2npVtmE0Nj4LNuqRF2ysYVb0JBR5ERaMICxUWRQW5SfKUvWaRNT5T1YyMjKvuSwQPg1Mt1BGXB8QH3BpVy+Ht55P7PdJ0rAVSoJP6Gl6PqZ7Qj37BKtdBlGmWJJyDDh/X2bJqxJHNPkxXpymkj7eAjC0aWm3MmBvQbpx6m9uC9fHI95DRdD0bJmk2BqMzfAcq3WFi0HQvzv3hnPr7sEBOYwv1VBhUUBkTpK2vZDj0CyJp+aUVgMKLiJKM+JpK0cXYFVPvFm+JCDcnHUoOnZ4BoYliyPji+PxPDWyQFLq8RfE6VCqjijNX2Hb8PTTJFf5ejGBz/aGBl8T5S1dqd6XNvqx/k4A3HREcE97Gr3BNxB8DYmPjH13BHI8UXe3sr5V+G3EjadZJkBPGRTfRJY0PgKnVdXVBbkHLXMaxx0kxwB1KllvDBdVJxmk3fjQW3NYIBp3PJm2EqS+6CbyUI3RLXB2v7JyZcTPGma7p1vdB1K3HuJc6VXE= ars1364@gmail.com"
+
+# Security
+ufw_allowed_ports:
+  - { port: 22, proto: tcp }
+  - { port: 80, proto: tcp }
+  - { port: 443, proto: tcp }
+
+fail2ban_maxretry: 3
+fail2ban_bantime: 3600
+
+# Sysctl hardening
+sysctl_settings:
+  net.ipv4.tcp_syncookies: 1
+  net.ipv4.conf.all.rp_filter: 1
+  net.ipv4.conf.default.rp_filter: 1
+  net.ipv4.conf.all.accept_redirects: 0
+  net.ipv4.conf.default.accept_redirects: 0
+  net.ipv4.conf.all.send_redirects: 0
+  net.ipv4.conf.default.send_redirects: 0
+  net.ipv4.icmp_echo_ignore_broadcasts: 1
+  net.ipv4.conf.all.accept_source_route: 0
+  net.ipv4.conf.default.accept_source_route: 0
+  kernel.sysrq: 0
+  net.ipv4.conf.all.log_martians: 1

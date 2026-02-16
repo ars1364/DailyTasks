@@ -1,0 +1,230 @@
+---
+- name: Deploy CloudLink (abreina.ir)
+  hosts: abreina
+  become: true
+  gather_facts: true
+
+  tasks:
+    # ── APT mirrors ──
+    - name: Configure Cloudinative APT mirrors
+      copy:
+        content: "{{ apt_sources }}"
+        dest: /etc/apt/sources.list
+        mode: '0644'
+
+    - name: Remove cloud-init sources
+      file:
+        path: /etc/apt/sources.list.d/ubuntu.sources
+        state: absent
+
+    - name: Update apt cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    # ── Base packages ──
+    - name: Install base packages
+      apt:
+        name:
+          - curl
+          - wget
+          - git
+          - vim
+          - htop
+          - net-tools
+          - jq
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+          - ufw
+          - fail2ban
+          - unattended-upgrades
+        state: present
+
+    # ── SSH keys ──
+    - name: Add extra SSH keys
+      authorized_key:
+        user: ubuntu
+        key: "{{ item }}"
+        state: present
+      loop: "{{ extra_ssh_keys }}"
+
+    # ── SSH hardening ──
+    - name: Disable password auth
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+      notify: restart ssh
+
+    - name: Disable root login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin no'
+      notify: restart ssh
+
+    # ── Firewall ──
+    - name: Set UFW default deny incoming
+      ufw:
+        direction: incoming
+        default: deny
+
+    - name: Set UFW default allow outgoing
+      ufw:
+        direction: outgoing
+        default: allow
+
+    - name: Allow UFW ports
+      ufw:
+        rule: allow
+        port: "{{ item.port | string }}"
+        proto: "{{ item.proto }}"
+      loop: "{{ ufw_allowed_ports }}"
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+
+    # ── Fail2ban ──
+    - name: Configure fail2ban
+      template:
+        src: templates/fail2ban-jail.local.j2
+        dest: /etc/fail2ban/jail.local
+        mode: '0644'
+      notify: restart fail2ban
+
+    # ── Kernel hardening ──
+    - name: Apply sysctl hardening
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/99-hardening.conf
+        reload: true
+      loop: "{{ sysctl_settings | dict2items }}"
+
+    # ── Docker ──
+    - name: Install Docker via Cloudinative mirror
+      shell: curl -fsSL https://download.cloudinative.com/install.sh | bash
+      args:
+        creates: /usr/bin/docker
+
+    - name: Add ubuntu to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: true
+
+    - name: Configure Docker daemon
+      template:
+        src: templates/docker-daemon.json.j2
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+      notify: restart docker
+
+    # ── Clone app ──
+    - name: Clone CloudLink repo
+      git:
+        repo: "{{ app_repo }}"
+        dest: "{{ app_dir }}"
+        version: master
+        depth: 1
+        force: true
+      become: false
+
+    - name: Create .env from example
+      copy:
+        src: "{{ app_dir }}/.env.example"
+        dest: "{{ app_dir }}/.env"
+        remote_src: true
+        force: false
+      become: false
+
+    # ── Start app ──
+    - name: Start app with docker compose
+      community.docker.docker_compose_v2:
+        project_src: "{{ app_dir }}"
+        state: present
+      become: false
+
+    - name: Wait for app to be ready
+      wait_for:
+        port: "{{ app_port }}"
+        delay: 30
+        timeout: 300
+
+    # ── Nginx ──
+    - name: Configure nginx main (server_tokens, rate limit, gzip)
+      blockinfile:
+        path: /etc/nginx/nginx.conf
+        insertafter: 'http {'
+        marker: "# {mark} ANSIBLE MANAGED - hardening"
+        block: |
+          server_tokens off;
+          limit_req_zone $binary_remote_addr zone=general:10m rate=10r/s;
+          gzip on;
+          gzip_vary on;
+          gzip_proxied any;
+          gzip_comp_level 6;
+          gzip_types text/plain text/css application/json application/javascript text/xml application/xml text/javascript image/svg+xml;
+      notify: reload nginx
+
+    - name: Get SSL certificate
+      command: >
+        certbot --nginx
+        -d {{ domain }} -d www.{{ domain }}
+        --non-interactive --agree-tos
+        --email {{ certbot_email }}
+      args:
+        creates: /etc/letsencrypt/live/{{ domain }}/fullchain.pem
+
+    - name: Deploy nginx site config
+      template:
+        src: templates/nginx-site.conf.j2
+        dest: /etc/nginx/sites-available/{{ domain }}
+        mode: '0644'
+      notify: reload nginx
+
+    - name: Remove default site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: reload nginx
+
+    - name: Enable site
+      file:
+        src: /etc/nginx/sites-available/{{ domain }}
+        dest: /etc/nginx/sites-enabled/{{ domain }}
+        state: link
+      notify: reload nginx
+
+    # ── Auto-updates ──
+    - name: Enable unattended upgrades
+      copy:
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        mode: '0644'
+
+  handlers:
+    - name: restart ssh
+      service:
+        name: ssh
+        state: restarted
+
+    - name: restart fail2ban
+      service:
+        name: fail2ban
+        state: restarted
+        enabled: true
+
+    - name: restart docker
+      service:
+        name: docker
+        state: restarted
+
+    - name: reload nginx
+      service:
+        name: nginx
+        state: reloaded
