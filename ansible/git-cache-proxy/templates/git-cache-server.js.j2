@@ -1,0 +1,174 @@
+#!/usr/bin/env node
+// git-cache-server: Transparent caching proxy for Git repositories
+// Caches upstream repos locally, serves from cache on repeat access.
+// Auto-refreshes when upstream has new commits.
+
+const http = require('http');
+const { execSync, spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+
+const CACHE_DIR = process.env.CACHE_DIR || '/var/cache/git';
+const PORT = parseInt(process.env.PORT || '8181', 10);
+const FETCH_TIMEOUT = 120000; // 2 min
+
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+// Extract upstream URL from request path: /github.com/user/repo.git -> https://github.com/user/repo.git
+function getUpstreamUrl(reqPath) {
+  // Remove leading slash, strip /info/refs or /git-upload-pack etc.
+  const clean = reqPath.replace(/^\/(.*?)(\/info\/refs|\/HEAD|\/objects\/.*|\/git-upload-pack|\/git-receive-pack)/, '$1');
+  if (!clean || clean === '/') return null;
+  return `https://${clean}`;
+}
+
+function getLocalPath(reqPath) {
+  const match = reqPath.match(/^\/(.+?\.git)(\/|$)/);
+  if (!match) {
+    // Try adding .git
+    const match2 = reqPath.match(/^\/(.+?)(\/info\/refs|\/HEAD|\/objects\/.*|\/git-upload-pack)/);
+    if (match2) return path.join(CACHE_DIR, match2[1] + '.git');
+    return null;
+  }
+  return path.join(CACHE_DIR, match[1]);
+}
+
+function getRepoSlug(reqPath) {
+  const match = reqPath.match(/^\/(.+?\.git)(\/|$)/);
+  if (match) return match[1];
+  const match2 = reqPath.match(/^\/(.+?)(\/info\/refs|\/HEAD|\/objects\/.*|\/git-upload-pack)/);
+  if (match2) return match2[1] + '.git';
+  return null;
+}
+
+function mirrorOrFetch(upstreamUrl, localPath) {
+  ensureDir(path.dirname(localPath));
+
+  if (fs.existsSync(path.join(localPath, 'HEAD'))) {
+    // Repo exists, try to fetch updates
+    try {
+      log(`Fetching updates: ${upstreamUrl}`);
+      execSync(`git -C "${localPath}" fetch --prune origin`, {
+        timeout: FETCH_TIMEOUT,
+        stdio: 'pipe'
+      });
+      log(`Fetch complete: ${upstreamUrl}`);
+    } catch (err) {
+      log(`Fetch failed (serving stale cache): ${err.message}`);
+      // Serve from stale cache -- this enables offline mode
+    }
+  } else {
+    // First time: clone mirror
+    log(`Cloning mirror: ${upstreamUrl} -> ${localPath}`);
+    try {
+      execSync(`git clone --mirror "${upstreamUrl}" "${localPath}"`, {
+        timeout: FETCH_TIMEOUT,
+        stdio: 'pipe'
+      });
+      // Enable dumb HTTP serving
+      execSync(`git -C "${localPath}" update-server-info`, { stdio: 'pipe' });
+      log(`Clone complete: ${upstreamUrl}`);
+    } catch (err) {
+      log(`Clone failed: ${err.message}`);
+      throw err;
+    }
+  }
+
+  // Always update server info for dumb HTTP clients
+  try {
+    execSync(`git -C "${localPath}" update-server-info`, { stdio: 'pipe' });
+  } catch (_) {}
+}
+
+function handleSmartHttp(req, res, localPath, service) {
+  // Smart HTTP: git-upload-pack
+  const args = service === 'git-upload-pack'
+    ? ['upload-pack', '--stateless-rpc', localPath]
+    : ['receive-pack', '--stateless-rpc', localPath];
+
+  res.setHeader('Content-Type', `application/x-${service}-result`);
+
+  const proc = spawn('git', args);
+  req.pipe(proc.stdin);
+  proc.stdout.pipe(res);
+  proc.stderr.on('data', (d) => log(`${service} stderr: ${d}`));
+  proc.on('close', (code) => {
+    if (code !== 0) log(`${service} exited with code ${code}`);
+  });
+}
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const reqPath = decodeURIComponent(url.pathname);
+
+  // Health check
+  if (reqPath === '/health') {
+    res.writeHead(200);
+    res.end('OK');
+    return;
+  }
+
+  const slug = getRepoSlug(reqPath);
+  if (!slug) {
+    res.writeHead(400);
+    res.end('Bad request: cannot determine repository from URL\n');
+    return;
+  }
+
+  const upstreamUrl = `https://${slug}`;
+  const localPath = path.join(CACHE_DIR, slug);
+  const service = url.searchParams.get('service');
+
+  try {
+    mirrorOrFetch(upstreamUrl, localPath);
+  } catch (err) {
+    res.writeHead(502);
+    res.end(`Failed to fetch upstream: ${err.message}\n`);
+    return;
+  }
+
+  // Smart HTTP: /info/refs?service=git-upload-pack
+  if (reqPath.endsWith('/info/refs') && service) {
+    const svcName = service.replace('git-', '');
+    res.setHeader('Content-Type', `application/x-${service}-advertisement`);
+
+    const proc = spawn('git', [svcName, '--stateless-rpc', '--advertise-refs', localPath]);
+    const pktLine = `# service=${service}\n`;
+    const pktLen = (pktLine.length + 4).toString(16).padStart(4, '0');
+
+    res.write(`${pktLen}${pktLine}0000`);
+    proc.stdout.pipe(res);
+    proc.stderr.on('data', (d) => log(`advertise stderr: ${d}`));
+    return;
+  }
+
+  // Smart HTTP: POST to git-upload-pack / git-receive-pack
+  if (req.method === 'POST' && (reqPath.endsWith('/git-upload-pack') || reqPath.endsWith('/git-receive-pack'))) {
+    const svc = reqPath.endsWith('/git-upload-pack') ? 'git-upload-pack' : 'git-receive-pack';
+    handleSmartHttp(req, res, localPath, svc);
+    return;
+  }
+
+  // Dumb HTTP: serve files directly from the bare repo
+  const repoRelative = reqPath.replace(`/${slug}`, '');
+  const filePath = path.join(localPath, repoRelative);
+
+  if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+    res.writeHead(200);
+    fs.createReadStream(filePath).pipe(res);
+  } else {
+    res.writeHead(404);
+    res.end('Not found\n');
+  }
+});
+
+ensureDir(CACHE_DIR);
+server.listen(PORT, () => {
+  log(`Git cache server listening on port ${PORT}, cache dir: ${CACHE_DIR}`);
+});

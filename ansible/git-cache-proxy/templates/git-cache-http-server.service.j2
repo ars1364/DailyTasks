@@ -1,0 +1,19 @@
+[Unit]
+Description=Git Cache HTTP Server
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+ExecStart=/usr/bin/node /opt/git-cache-server/git-cache-server.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+KillMode=mixed
+Environment=NODE_ENV=production
+Environment=PORT=8181
+Environment=CACHE_DIR=/var/cache/git
+
+[Install]
+WantedBy=multi-user.target

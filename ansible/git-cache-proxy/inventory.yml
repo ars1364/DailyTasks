@@ -1,0 +1,22 @@
+---
+all:
+  vars:
+    ansible_ssh_private_key_file: ~/openstacktasks/id_ed25519
+    ansible_user: ubuntu
+
+  hosts:
+    localhost:
+      ansible_connection: local
+
+    artifact:
+      ansible_host: 10.20.0.40
+      ansible_ssh_common_args: >-
+        -o ProxyCommand="ssh -W %h:%p -i ~/openstacktasks/id_ed25519 ubuntu@46.245.69.222"
+
+    dns_server:
+      ansible_host: 46.245.69.222
+
+    reverse_proxy:
+      ansible_host: 10.20.0.10
+      ansible_ssh_common_args: >-
+        -o ProxyCommand="ssh -W %h:%p -i ~/openstacktasks/id_ed25519 ubuntu@46.245.69.222"

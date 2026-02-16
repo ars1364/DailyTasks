@@ -1,0 +1,192 @@
+---
+# Ansible Playbook: Deploy git-cache-http-server as a transparent Git caching proxy
+# Caches GitHub (and any Git host) repos locally, serves from cache on repeat access.
+#
+# Usage:
+#   ansible-playbook -i inventory.yml playbook.yml
+
+- name: Install and configure git-cache-http-server on artifact VM
+  hosts: artifact
+  become: yes
+  gather_facts: yes
+
+  vars:
+    cache_dir: /var/cache/git
+    cache_port: 8181
+    service_name: git-cache-http-server
+
+  tasks:
+    - name: Install git (required by git-cache-http-server)
+      apt:
+        name:
+          - git
+        state: present
+        update_cache: yes
+
+    - name: Check if Node.js is installed
+      command: node --version
+      register: node_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install Node.js via apt if not present
+      apt:
+        name: nodejs
+        state: present
+      when: node_check.rc != 0
+
+    - name: Check if npm is installed
+      command: npm --version
+      register: npm_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install npm if not present
+      apt:
+        name: npm
+        state: present
+      when: npm_check.rc != 0
+
+    - name: Create application directory
+      file:
+        path: /opt/git-cache-server
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy git-cache-server script
+      template:
+        src: templates/git-cache-server.js.j2
+        dest: /opt/git-cache-server/git-cache-server.js
+        mode: "0755"
+      register: script_deployed
+
+    - name: Create cache directory
+      file:
+        path: "{{ cache_dir }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: "0755"
+
+    - name: Deploy systemd service file
+      template:
+        src: templates/git-cache-http-server.service.j2
+        dest: /etc/systemd/system/{{ service_name }}.service
+        mode: "0644"
+      register: service_file
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+      when: service_file is changed
+
+    - name: Enable and start git-cache-http-server
+      systemd:
+        name: "{{ service_name }}"
+        enabled: yes
+        state: started
+      register: service_start
+
+    - name: Restart service if script or config changed
+      systemd:
+        name: "{{ service_name }}"
+        state: restarted
+      when: (service_file is changed or script_deployed is changed) and not service_start is changed
+
+    - name: Wait for service to be ready
+      wait_for:
+        port: "{{ cache_port }}"
+        timeout: 10
+
+    - name: Verify service is running
+      command: systemctl is-active {{ service_name }}
+      register: service_status
+      changed_when: false
+
+    - name: Report service status
+      debug:
+        msg: "git-cache-http-server: {{ service_status.stdout }} on port {{ cache_port }}"
+
+- name: Add DNS record for git.cloudinative.com
+  hosts: dns_server
+  become: yes
+  gather_facts: no
+
+  vars:
+    zone_file: "/etc/bind/zones/db.cloudinative.com"
+    subdomain: "git"
+    target_ip: "176.65.243.214"
+
+  tasks:
+    - name: Check if DNS record already exists
+      command: grep -cw '{{ subdomain }}' {{ zone_file }}
+      register: dns_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Add A record to zone file
+      lineinfile:
+        path: "{{ zone_file }}"
+        insertafter: '^;.*proxy records|;.*Proxy|;.*A records'
+        line: "{{ subdomain }}           IN      A       {{ target_ip }}"
+        state: present
+      when: dns_check.stdout | default('0') | int == 0
+      register: dns_added
+
+    - name: Increment zone serial
+      shell: |
+        SERIAL=$(grep -oP '\d{10}' {{ zone_file }} | head -1)
+        NEW_SERIAL=$(( SERIAL + 1 ))
+        sed -i "s/$SERIAL/$NEW_SERIAL/" {{ zone_file }}
+      when: dns_added is changed
+
+    - name: Reload BIND9
+      service:
+        name: bind9
+        state: reloaded
+      when: dns_added is changed
+
+    - name: Verify DNS resolution
+      command: dig +short {{ subdomain }}.cloudinative.com @localhost
+      register: dns_verify
+      changed_when: false
+
+    - name: Report DNS result
+      debug:
+        msg: "DNS {{ subdomain }}.cloudinative.com -> {{ dns_verify.stdout }}"
+
+- name: Configure reverse proxy for git.cloudinative.com
+  hosts: reverse_proxy
+  become: yes
+  gather_facts: no
+
+  tasks:
+    - name: Check if nginx site already exists
+      stat:
+        path: /etc/nginx/sites-enabled/git-proxy
+      register: nginx_check
+
+    - name: Deploy nginx config
+      template:
+        src: templates/git-proxy.conf.j2
+        dest: /etc/nginx/sites-enabled/git-proxy
+        mode: "0644"
+      when: not nginx_check.stat.exists
+      register: nginx_deployed
+
+    - name: Test nginx configuration
+      command: nginx -t
+      when: nginx_deployed is changed
+      register: nginx_test
+
+    - name: Reload nginx
+      service:
+        name: nginx
+        state: reloaded
+      when: nginx_deployed is changed and nginx_test.rc == 0
+
+    - name: Report result
+      debug:
+        msg: "Reverse proxy configured for git.cloudinative.com -> 10.20.0.40:8181"
