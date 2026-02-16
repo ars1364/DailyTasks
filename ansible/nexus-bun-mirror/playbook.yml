@@ -1,0 +1,264 @@
+---
+# Ansible Playbook: Localize Bun install through Cloudinative infrastructure
+# Mirrors bun.sh/install script and GitHub releases via Nexus.
+#
+# Usage:
+#   export NEXUS_PASSWORD='your-nexus-admin-password'
+#   ansible-playbook -i inventory.yml playbook.yml
+
+- name: Create Bun mirror repositories in Nexus
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars:
+    nexus_url: "https://artifact.cloudinative.com"
+    nexus_user: "admin"
+    nexus_password: "{{ lookup('env', 'NEXUS_PASSWORD') | default('changeme', true) }}"
+    anon_role: "anonymous-proxy-only"
+    mirror_domain: "bun.cloudinative.com"
+
+  tasks:
+    # --- Raw proxy for GitHub releases ---
+    - name: Check if bun-github-releases repo exists
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/repositories/raw/proxy/bun-github-releases"
+        method: GET
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 404]
+      register: github_repo_check
+
+    - name: Create bun-github-releases raw proxy repo
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/repositories/raw/proxy"
+        method: POST
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        body_format: json
+        body:
+          name: "bun-github-releases"
+          online: true
+          storage:
+            blobStoreName: default
+            strictContentTypeValidation: false
+          proxy:
+            remoteUrl: "https://github.com"
+            contentMaxAge: 1440
+            metadataMaxAge: 1440
+          negativeCache:
+            enabled: true
+            timeToLive: 1440
+          httpClient:
+            blocked: false
+            autoBlock: true
+        headers:
+          Content-Type: application/json
+        status_code: [201]
+      when: github_repo_check.status == 404
+
+    # --- Raw hosted for modified install script ---
+    - name: Check if bun-install repo exists
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/repositories/raw/hosted/bun-install"
+        method: GET
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200, 404]
+      register: install_repo_check
+
+    - name: Create bun-install raw hosted repo
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/repositories/raw/hosted"
+        method: POST
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        body_format: json
+        body:
+          name: "bun-install"
+          online: true
+          storage:
+            blobStoreName: default
+            strictContentTypeValidation: false
+            writePolicy: ALLOW
+        headers:
+          Content-Type: application/json
+        status_code: [201]
+      when: install_repo_check.status == 404
+
+    # --- Download and patch install script ---
+    - name: Download original bun install script
+      get_url:
+        url: "https://bun.sh/install"
+        dest: "/tmp/bun-install-original.sh"
+        mode: "0644"
+
+    - name: Patch install script to use our mirror
+      shell: |
+        sed 's|GITHUB=${GITHUB-"https://github.com"}|GITHUB=${GITHUB-"https://{{ mirror_domain }}/github"}|' \
+          /tmp/bun-install-original.sh > /tmp/bun-install-patched.sh
+      changed_when: true
+
+    - name: Upload patched install script to Nexus
+      command: >
+        curl -sf -u {{ nexus_user }}:{{ nexus_password }}
+        --upload-file /tmp/bun-install-patched.sh
+        -H "Content-Type: text/x-shellscript"
+        -k {{ nexus_url }}/repository/bun-install/install.sh
+      register: script_upload
+      changed_when: script_upload.rc == 0
+
+    # --- Anonymous access ---
+    - name: Get current anonymous role privileges
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/security/roles/{{ anon_role }}"
+        method: GET
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: [200]
+      register: current_role
+
+    - name: Build updated privilege list
+      set_fact:
+        updated_privileges: >-
+          {{ current_role.json.privileges | union([
+            'nx-repository-view-raw-bun-github-releases-read',
+            'nx-repository-view-raw-bun-github-releases-browse',
+            'nx-repository-view-raw-bun-install-read',
+            'nx-repository-view-raw-bun-install-browse'
+          ]) }}
+
+    - name: Update anonymous role with bun repo privileges
+      uri:
+        url: "{{ nexus_url }}/service/rest/v1/security/roles/{{ anon_role }}"
+        method: PUT
+        user: "{{ nexus_user }}"
+        password: "{{ nexus_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        body_format: json
+        body:
+          id: "{{ anon_role }}"
+          name: "{{ current_role.json.name }}"
+          description: "{{ current_role.json.description }}"
+          privileges: "{{ updated_privileges }}"
+          roles: []
+        status_code: [204]
+      when: >-
+        'nx-repository-view-raw-bun-install-read' not in current_role.json.privileges
+
+    # --- Verify ---
+    - name: Verify install script is accessible
+      uri:
+        url: "{{ nexus_url }}/repository/bun-install/install.sh"
+        method: GET
+        validate_certs: no
+        status_code: [200]
+      register: verify_script
+      ignore_errors: yes
+
+    - name: Report Nexus results
+      debug:
+        msg: "Install script: {{ 'OK' if verify_script.status | default(0) == 200 else 'FAILED' }}"
+
+- name: Add DNS record for bun.cloudinative.com
+  hosts: dns_server
+  become: yes
+  gather_facts: no
+
+  vars:
+    zone_file: "/etc/bind/zones/db.cloudinative.com"
+    subdomain: "bun"
+    target_ip: "176.65.243.214"
+
+  tasks:
+    - name: Check if DNS record already exists
+      command: grep -c '{{ subdomain }}' {{ zone_file }}
+      register: dns_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Add A record to zone file
+      lineinfile:
+        path: "{{ zone_file }}"
+        insertafter: '^;.*proxy records|;.*Proxy|;.*A records'
+        line: "{{ subdomain }}          IN      A       {{ target_ip }}"
+        state: present
+      when: dns_check.stdout | default('0') | int == 0
+      register: dns_added
+
+    - name: Increment zone serial
+      shell: |
+        SERIAL=$(grep -oP '\d{10}' {{ zone_file }} | head -1)
+        NEW_SERIAL=$(( SERIAL + 1 ))
+        sed -i "s/$SERIAL/$NEW_SERIAL/" {{ zone_file }}
+      when: dns_added is changed
+
+    - name: Reload BIND9
+      service:
+        name: bind9
+        state: reloaded
+      when: dns_added is changed
+
+    - name: Verify DNS resolution
+      command: dig +short {{ subdomain }}.cloudinative.com @localhost
+      register: dns_verify
+      changed_when: false
+
+    - name: Report DNS result
+      debug:
+        msg: "DNS {{ subdomain }}.cloudinative.com -> {{ dns_verify.stdout }}"
+
+- name: Configure reverse proxy for bun.cloudinative.com
+  hosts: reverse_proxy
+  become: yes
+  gather_facts: no
+
+  tasks:
+    - name: Check if nginx site already exists
+      stat:
+        path: /etc/nginx/sites-enabled/bun-proxy
+      register: nginx_check
+
+    - name: Deploy nginx config
+      template:
+        src: templates/bun-proxy.conf.j2
+        dest: /etc/nginx/sites-enabled/bun-proxy
+        mode: "0644"
+      when: not nginx_check.stat.exists
+      register: nginx_deployed
+
+    - name: Test nginx configuration
+      command: nginx -t
+      when: nginx_deployed is changed
+      register: nginx_test
+
+    - name: Reload nginx
+      service:
+        name: nginx
+        state: reloaded
+      when: nginx_deployed is changed and nginx_test.rc == 0
+
+    - name: Verify install endpoint
+      uri:
+        url: "https://bun.cloudinative.com/install"
+        method: GET
+        validate_certs: no
+        status_code: [200]
+      delegate_to: localhost
+      register: endpoint_verify
+      ignore_errors: yes
+
+    - name: Report endpoint result
+      debug:
+        msg: "Endpoint https://bun.cloudinative.com/install: {{ 'OK' if endpoint_verify.status | default(0) == 200 else 'FAILED' }}"
