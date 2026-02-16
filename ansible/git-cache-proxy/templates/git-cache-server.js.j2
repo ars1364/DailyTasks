@@ -1,16 +1,21 @@
 #!/usr/bin/env node
-// git-cache-server: Transparent caching proxy for Git repositories
+// git-cache-server: Transparent caching proxy for Git repositories and releases
 // Caches upstream repos locally, serves from cache on repeat access.
+// Also caches archive/release downloads (zip, tar.gz).
 // Auto-refreshes when upstream has new commits.
 
 const http = require('http');
+const https = require('https');
 const { execSync, spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 const CACHE_DIR = process.env.CACHE_DIR || '/var/cache/git';
+const DOWNLOAD_CACHE_DIR = path.join(CACHE_DIR, '_downloads');
 const PORT = parseInt(process.env.PORT || '8181', 10);
 const FETCH_TIMEOUT = 120000; // 2 min
+const DOWNLOAD_TIMEOUT = 300000; // 5 min for large archives
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -20,24 +25,119 @@ function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-// Extract upstream URL from request path: /github.com/user/repo.git -> https://github.com/user/repo.git
-function getUpstreamUrl(reqPath) {
-  // Remove leading slash, strip /info/refs or /git-upload-pack etc.
-  const clean = reqPath.replace(/^\/(.*?)(\/info\/refs|\/HEAD|\/objects\/.*|\/git-upload-pack|\/git-receive-pack)/, '$1');
-  if (!clean || clean === '/') return null;
-  return `https://${clean}`;
+// Detect if this is a file download (archive, release asset) vs git protocol
+function isDownloadRequest(reqPath) {
+  return /\/(archive|releases\/download|raw|blob)\//i.test(reqPath) ||
+         /\.(zip|tar\.gz|tgz|tar\.bz2|tar\.xz|deb|rpm|AppImage|dmg|exe|msi|pkg)(\?.*)?$/i.test(reqPath);
 }
 
-function getLocalPath(reqPath) {
-  const match = reqPath.match(/^\/(.+?\.git)(\/|$)/);
-  if (!match) {
-    // Try adding .git
-    const match2 = reqPath.match(/^\/(.+?)(\/info\/refs|\/HEAD|\/objects\/.*|\/git-upload-pack)/);
-    if (match2) return path.join(CACHE_DIR, match2[1] + '.git');
-    return null;
-  }
-  return path.join(CACHE_DIR, match[1]);
+// Get a safe cache path for a download URL
+function getDownloadCachePath(reqPath) {
+  const hash = crypto.createHash('sha256').update(reqPath).digest('hex').slice(0, 16);
+  const basename = path.basename(reqPath.split('?')[0]) || 'download';
+  return path.join(DOWNLOAD_CACHE_DIR, hash + '_' + basename);
 }
+
+// Download a file from upstream, following redirects (up to 10)
+function downloadFile(url, destPath, maxRedirects = 10) {
+  return new Promise((resolve, reject) => {
+    if (maxRedirects <= 0) return reject(new Error('Too many redirects'));
+
+    const proto = url.startsWith('https') ? https : http;
+    const req = proto.get(url, { timeout: DOWNLOAD_TIMEOUT, headers: { 'User-Agent': 'git-cache-server/1.0' } }, (res) => {
+      // Follow redirects (GitHub sends 302 for archives -> codeload/objects)
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        log(`Redirect ${res.statusCode}: ${res.headers.location}`);
+        return downloadFile(res.headers.location, destPath, maxRedirects - 1).then(resolve).catch(reject);
+      }
+
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode} from upstream`));
+      }
+
+      ensureDir(path.dirname(destPath));
+      const tmpPath = destPath + '.tmp';
+      const ws = fs.createWriteStream(tmpPath);
+      let bytes = 0;
+
+      res.pipe(ws);
+      res.on('data', (chunk) => { bytes += chunk.length; });
+      ws.on('finish', () => {
+        fs.renameSync(tmpPath, destPath);
+        log(`Downloaded ${bytes} bytes -> ${destPath}`);
+        resolve(destPath);
+      });
+      ws.on('error', (err) => {
+        try { fs.unlinkSync(tmpPath); } catch (_) {}
+        reject(err);
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Download timeout')); });
+  });
+}
+
+// Serve a cached download, or fetch from upstream first
+async function handleDownload(req, res, reqPath) {
+  const cachePath = getDownloadCachePath(reqPath);
+  const metaPath = cachePath + '.meta';
+  const upstreamUrl = `https://${reqPath.slice(1)}`; // Remove leading /
+
+  // Serve from cache if exists
+  if (fs.existsSync(cachePath)) {
+    log(`Cache hit: ${reqPath}`);
+    const stat = fs.statSync(cachePath);
+    const ext = path.extname(cachePath).toLowerCase();
+    const contentType = {
+      '.zip': 'application/zip',
+      '.gz': 'application/gzip',
+      '.tgz': 'application/gzip',
+      '.xz': 'application/x-xz',
+      '.bz2': 'application/x-bzip2',
+      '.tar': 'application/x-tar',
+      '.deb': 'application/vnd.debian.binary-package',
+      '.rpm': 'application/x-rpm',
+      '.exe': 'application/octet-stream',
+      '.msi': 'application/octet-stream',
+      '.dmg': 'application/octet-stream',
+      '.pkg': 'application/octet-stream',
+      '.AppImage': 'application/octet-stream',
+    }[ext] || 'application/octet-stream';
+
+    res.writeHead(200, {
+      'Content-Type': contentType,
+      'Content-Length': stat.size,
+      'Content-Disposition': `attachment; filename="${path.basename(cachePath).replace(/^[a-f0-9]+_/, '')}"`,
+      'X-Cache': 'HIT'
+    });
+    fs.createReadStream(cachePath).pipe(res);
+    return;
+  }
+
+  // Fetch from upstream
+  log(`Cache miss, downloading: ${upstreamUrl}`);
+  try {
+    await downloadFile(upstreamUrl, cachePath);
+    // Save metadata
+    fs.writeFileSync(metaPath, JSON.stringify({ url: upstreamUrl, cached: new Date().toISOString() }));
+
+    // Serve the downloaded file
+    const stat = fs.statSync(cachePath);
+    res.writeHead(200, {
+      'Content-Type': 'application/octet-stream',
+      'Content-Length': stat.size,
+      'Content-Disposition': `attachment; filename="${path.basename(cachePath).replace(/^[a-f0-9]+_/, '')}"`,
+      'X-Cache': 'MISS'
+    });
+    fs.createReadStream(cachePath).pipe(res);
+  } catch (err) {
+    log(`Download failed: ${err.message}`);
+    res.writeHead(502);
+    res.end(`Failed to fetch upstream: ${err.message}\n`);
+  }
+}
+
+// --- Git protocol helpers ---
 
 function getRepoSlug(reqPath) {
   const match = reqPath.match(/^\/(.+?\.git)(\/|$)/);
@@ -51,27 +151,21 @@ function mirrorOrFetch(upstreamUrl, localPath) {
   ensureDir(path.dirname(localPath));
 
   if (fs.existsSync(path.join(localPath, 'HEAD'))) {
-    // Repo exists, try to fetch updates
     try {
       log(`Fetching updates: ${upstreamUrl}`);
       execSync(`git -C "${localPath}" fetch --prune origin`, {
-        timeout: FETCH_TIMEOUT,
-        stdio: 'pipe'
+        timeout: FETCH_TIMEOUT, stdio: 'pipe'
       });
       log(`Fetch complete: ${upstreamUrl}`);
     } catch (err) {
       log(`Fetch failed (serving stale cache): ${err.message}`);
-      // Serve from stale cache -- this enables offline mode
     }
   } else {
-    // First time: clone mirror
     log(`Cloning mirror: ${upstreamUrl} -> ${localPath}`);
     try {
       execSync(`git clone --mirror "${upstreamUrl}" "${localPath}"`, {
-        timeout: FETCH_TIMEOUT,
-        stdio: 'pipe'
+        timeout: FETCH_TIMEOUT, stdio: 'pipe'
       });
-      // Enable dumb HTTP serving
       execSync(`git -C "${localPath}" update-server-info`, { stdio: 'pipe' });
       log(`Clone complete: ${upstreamUrl}`);
     } catch (err) {
@@ -80,14 +174,10 @@ function mirrorOrFetch(upstreamUrl, localPath) {
     }
   }
 
-  // Always update server info for dumb HTTP clients
-  try {
-    execSync(`git -C "${localPath}" update-server-info`, { stdio: 'pipe' });
-  } catch (_) {}
+  try { execSync(`git -C "${localPath}" update-server-info`, { stdio: 'pipe' }); } catch (_) {}
 }
 
 function handleSmartHttp(req, res, localPath, service) {
-  // Smart HTTP: git-upload-pack
   const args = service === 'git-upload-pack'
     ? ['upload-pack', '--stateless-rpc', localPath]
     : ['receive-pack', '--stateless-rpc', localPath];
@@ -103,7 +193,9 @@ function handleSmartHttp(req, res, localPath, service) {
   });
 }
 
-const server = http.createServer((req, res) => {
+// --- Main server ---
+
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const reqPath = decodeURIComponent(url.pathname);
 
@@ -114,6 +206,21 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // File download (archives, releases, raw files)
+  if (isDownloadRequest(reqPath)) {
+    try {
+      await handleDownload(req, res, reqPath);
+    } catch (err) {
+      log(`Download handler error: ${err.message}`);
+      if (!res.headersSent) {
+        res.writeHead(500);
+        res.end(`Internal error: ${err.message}\n`);
+      }
+    }
+    return;
+  }
+
+  // Git protocol
   const slug = getRepoSlug(reqPath);
   if (!slug) {
     res.writeHead(400);
@@ -169,6 +276,7 @@ const server = http.createServer((req, res) => {
 });
 
 ensureDir(CACHE_DIR);
+ensureDir(DOWNLOAD_CACHE_DIR);
 server.listen(PORT, () => {
   log(`Git cache server listening on port ${PORT}, cache dir: ${CACHE_DIR}`);
 });
